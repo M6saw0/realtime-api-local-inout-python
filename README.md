@@ -5,6 +5,8 @@ This code has been modified to enable conversations with a real-time API using y
 `voice_chat.py` is created based on [aoai-realtime-audio-sdk/python/samples/low_level_sample.py](https://github.com/Azure-Samples/aoai-realtime-audio-sdk/blob/main/python/samples/low_level_sample.py).  
 You can find a detailed explanation of `low_level_sample.py` [here](https://m-sea-bass.blogspot.com/2024/10/welcome-file.html).
 
+Please make sure to read the Code of Conduct and license for [aoai-realtime-audio-sdk](https://github.com/Azure-Samples/aoai-realtime-audio-sdk) before using this code.
+
 ## Usage
 ### Installing Dependencies
 Install the necessary dependencies with the following command:
