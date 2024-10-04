@@ -1,0 +1,5 @@
+aiohttp
+azure-core
+python-dotenv
+pyaudio
+pydantic
