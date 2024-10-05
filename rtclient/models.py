@@ -255,6 +255,12 @@ class SessionCreatedMessage(ServerMessageBase):
     session: Session
 
 
+class SessionUpdatedMessage(ServerMessageBase):
+    type: Literal["session.updated"] = "session.updated"
+    session: Session
+
+
+
 class InputAudioBufferCommittedMessage(ServerMessageBase):
     """
     Signals the server has received and processed the audio buffer.
@@ -621,6 +627,8 @@ def create_message_from_dict(data: dict) -> ServerMessageType:
             return ErrorMessage(**data)
         case "session.created":
             return SessionCreatedMessage(**data)
+        case "session.updated":
+            return SessionUpdatedMessage(**data)
         case "input_audio_buffer.committed":
             return InputAudioBufferCommittedMessage(**data)
         case "input_audio_buffer.cleared":
