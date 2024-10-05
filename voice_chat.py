@@ -3,6 +3,7 @@
 
 import asyncio
 import base64
+import json
 import os
 import sys
 import time
@@ -18,56 +19,68 @@ from rtclient import (
     ServerVAD,
     SessionUpdateMessage,
     SessionUpdateParams,
+    ResponseCreateMessage,
+    ResponseCreateParams,
+    ItemCreateMessage,
+    FunctionCallOutputItem,
+    Item,
+)
+from config import (
+    INPUT_SAMPLE_RATE,
+    INPUT_CHUNK_SIZE,
+    OUTPUT_SAMPLE_RATE,
+    OUTPUT_CHUNK_SIZE,
+    STREAM_FORMAT,
+    INPUT_CHANNELS,
+    OUTPUT_CHANNELS,
+    OUTPUT_SAMPLE_WIDTH,
+    INSTRUCTIONS,
+    VOICE_TYPE,
+    TEMPERATURE,
+    MAX_RESPONSE_OUTPUT_TOKENS,
+    TOOLS,
+    TOOL_CHOICE,
+    TOOL_MAP
 )
 
 
-INPUT_SAMPLE_RATE = 16000  # Input sample rate
-INPUT_CHUNK_SIZE = 512  # Input chunk size
-OUTPUT_SAMPLE_RATE = 24000  # Output sample rate. ** Note: This must be 24000 **
-OUTPUT_CHUNK_SIZE = 4000  # Output chunk size
-STREAM_FORMAT = pyaudio.paInt16  # Stream format
-INPUT_CHANNELS = 1  # Input channels
-OUTPUT_CHANNELS = 1  # Output channels
-OUTPUT_SAMPLE_WIDTH = 2  # Output sample width
 
-
-async def send_audio(client: RTLowLevelClient):
-    p = pyaudio.PyAudio()
-    default_input_index = p.get_default_input_device_info()['index']
-    stream = p.open(
-        format=STREAM_FORMAT,
-        channels=INPUT_CHANNELS,
-        rate=INPUT_SAMPLE_RATE,
-        input=True,
-        output=False,
-        frames_per_buffer=INPUT_CHUNK_SIZE,
-        input_device_index=default_input_index,
-        start=False,
+async def call_tool(client: RTLowLevelClient, previous_item_id: str, call_id: str, tool_name: str, arguments: dict):
+    tool_func = TOOL_MAP[tool_name]
+    tool_output = tool_func(**arguments)
+    print(f"tool_output: {tool_output}")
+    await client.send(
+        ItemCreateMessage(
+            item=FunctionCallOutputItem(
+                call_id=call_id, 
+                output=tool_output,
+            ),
+            previous_item_id=previous_item_id,
+        )
     )
-    stream.start_stream()
+    await client.send(
+        ResponseCreateMessage(
+            response=ResponseCreateParams(
+            )
+        )
+    )
 
-    print("Start sending audio")
+
+async def send_audio(client: RTLowLevelClient, input_stream: pyaudio.Stream):
+    def get_audio_data():
+        try: 
+            return input_stream.read(INPUT_CHUNK_SIZE, exception_on_overflow=False)
+        except Exception as e:
+            return None
     while not client.closed:
-        audio_data = stream.read(INPUT_CHUNK_SIZE, exception_on_overflow=False)
+        audio_data = await asyncio.get_event_loop().run_in_executor(None, get_audio_data)
+        if audio_data is None:
+            continue
         base64_audio = base64.b64encode(audio_data).decode("utf-8")
         await client.send(InputAudioBufferAppendMessage(audio=base64_audio))
 
 
-async def receive_messages(client: RTLowLevelClient):
-    p = pyaudio.PyAudio()
-    default_output_index = p.get_default_output_device_info()['index']
-    stream = p.open(
-        format=STREAM_FORMAT,
-        channels=OUTPUT_CHANNELS,
-        rate=OUTPUT_SAMPLE_RATE,
-        input=False,
-        output=True,
-        output_device_index=default_output_index,
-        start=False,
-    )
-    stream.start_stream()
-
-    print("Start receiving messages")
+async def receive_messages(client: RTLowLevelClient, output_stream: pyaudio.Stream):
     while True:
         message = await client.recv()
         # print(f"{message=}")
@@ -75,9 +88,9 @@ async def receive_messages(client: RTLowLevelClient):
             continue
         match message.type:
             case "session.created":
-                print("Session Created Message")
-                print(f"  Model: {message.session.model}")
-                print(f"  Session Id: {message.session.id}")
+                # print("Session Created Message")
+                # print(f"  Model: {message.session.model}")
+                # print(f"  Session Id: {message.session.id}")
                 pass
             case "error":
                 print("Error Message")
@@ -120,8 +133,9 @@ async def receive_messages(client: RTLowLevelClient):
                 print(f" Content Index: {message.content_index}")
                 print(f"  Audio End [ms]: {message.audio_end_ms}")
             case "conversation.item.deleted":
-                print("Conversation Item Deleted Message")
-                print(f"  Id: {message.item_id}")
+                # print("Conversation Item Deleted Message")
+                # print(f"  Id: {message.item_id}")
+                pass
             case "conversation.item.input_audio_transcription.completed":
                 print("Input Audio Transcription Completed Message")
                 print(f"  Id: {message.item_id}")
@@ -168,72 +182,87 @@ async def receive_messages(client: RTLowLevelClient):
                         print(f"    Call Id: {item.call_id}")
                         print(f"    Output: {item.output}")
             case "response.done":
-                print("Response Done Message")
-                print(f"  Response Id: {message.response.id}")
-                if message.response.status_details:
-                    print(f"  Status Details: {message.response.status_details.model_dump_json()}")
+                # print("Response Done Message")
+                # print(f"  Response Id: {message.response.id}")
+                # if message.response.status_details:
+                #     print(f"  Status Details: {message.response.status_details.model_dump_json()}")
                 # break
+                pass
             case "response.output_item.added":
-                print("Response Output Item Added Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Item Id: {message.item.id}")
+                # print("Response Output Item Added Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Item Id: {message.item.id}")
+                pass
             case "response.output_item.done":
-                print("Response Output Item Done Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Item Id: {message.item.id}")
+                # print("Response Output Item Done Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Item Id: {message.item.id}")
+                pass
 
             case "response.content_part.added":
-                print("Response Content Part Added Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Item Id: {message.item_id}")
+                # print("Response Content Part Added Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Item Id: {message.item_id}")
+                pass
             case "response.content_part.done":
-                print("Response Content Part Done Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  ItemPart Id: {message.item_id}")
+                # print("Response Content Part Done Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  ItemPart Id: {message.item_id}")
+                pass
             case "response.text.delta":
-                print("Response Text Delta Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Text: {message.delta}")
+                # print("Response Text Delta Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Text: {message.delta}")
+                pass
             case "response.text.done":
                 print("Response Text Done Message")
                 print(f"  Response Id: {message.response_id}")
                 print(f"  Text: {message.text}")
             case "response.audio_transcript.delta":
-                print("Response Audio Transcript Delta Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Item Id: {message.item_id}")
-                print(f"  Transcript: {message.delta}")
+                # print("Response Audio Transcript Delta Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Item Id: {message.item_id}")
+                # print(f"  Transcript: {message.delta}")
+                pass
             case "response.audio_transcript.done":
                 print("Response Audio Transcript Done Message")
                 print(f"  Response Id: {message.response_id}")
                 print(f"  Item Id: {message.item_id}")
                 print(f"  Transcript: {message.transcript}")
             case "response.audio.delta":
-                print("Response Audio Delta Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Item Id: {message.item_id}")
-                print(f"  Audio Data Length: {len(message.delta)}")
+                # print("Response Audio Delta Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Item Id: {message.item_id}")
+                # print(f"  Audio Data Length: {len(message.delta)}")
                 audio_data = base64.b64decode(message.delta)
-                print(f"  Audio Binary Data Length: {len(audio_data)}")
-                audio_duration = len(audio_data) / OUTPUT_SAMPLE_RATE / OUTPUT_SAMPLE_WIDTH / OUTPUT_CHANNELS
-                print(f"  Audio Duration: {audio_duration}")
-                start_time = time.time()
+                # print(f"  Audio Binary Data Length: {len(audio_data)}")
+                # audio_duration = len(audio_data) / OUTPUT_SAMPLE_RATE / OUTPUT_SAMPLE_WIDTH / OUTPUT_CHANNELS
+                # print(f"  Audio Duration: {audio_duration}")
+                # start_time = time.time()
                 # audio_data = np.frombuffer(audio_data, dtype=np.int16).tobytes()
                 for i in range(0, len(audio_data), OUTPUT_CHUNK_SIZE):
-                    stream.write(audio_data[i:i+OUTPUT_CHUNK_SIZE])
-                time.sleep(max(0, audio_duration - (time.time() - start_time) - 0.05))
+                    await asyncio.get_event_loop().run_in_executor(None, output_stream.write, audio_data[i:i+OUTPUT_CHUNK_SIZE])
+                # await asyncio.sleep(max(0, audio_duration - (time.time() - start_time) - 0.05))
+                await asyncio.sleep(0)
             case "response.audio.done":
-                print("Response Audio Done Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Item Id: {message.item_id}")
+                # print("Response Audio Done Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Item Id: {message.item_id}")
+                pass
             case "response.function_call_arguments.delta":
-                print("Response Function Call Arguments Delta Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Arguments: {message.delta}")
+                # print("Response Function Call Arguments Delta Message")
+                # print(f"  Response Id: {message.response_id}")
+                # print(f"  Arguments: {message.delta}")
+                pass
             case "response.function_call_arguments.done":
                 print("Response Function Call Arguments Done Message")
                 print(f"  Response Id: {message.response_id}")
                 print(f"  Arguments: {message.arguments}")
+                try:
+                    arguments = json.loads(message.arguments)
+                    await call_tool(client, message.item_id, message.call_id, message.name, arguments)
+                except Exception as e:
+                    print(f"Error calling tool: {e}")
             case "rate_limits.updated":
                 print("Rate Limits Updated Message")
                 print(f"  Rate Limits: {message.rate_limits}")
@@ -252,6 +281,34 @@ async def with_azure_openai():
     endpoint = get_env_var("AZURE_OPENAI_ENDPOINT")
     key = get_env_var("AZURE_OPENAI_API_KEY")
     deployment = get_env_var("AZURE_OPENAI_DEPLOYMENT")
+
+    p = pyaudio.PyAudio()
+    input_default_input_index = p.get_default_input_device_info()['index']
+    input_stream = p.open(
+        format=STREAM_FORMAT,
+        channels=INPUT_CHANNELS,
+        rate=INPUT_SAMPLE_RATE,
+        input=True,
+        output=False,
+        frames_per_buffer=INPUT_CHUNK_SIZE,
+        input_device_index=input_default_input_index,
+        start=False,
+    )
+    output_default_output_index = p.get_default_output_device_info()['index']
+    output_stream = p.open(
+        format=STREAM_FORMAT,
+        channels=OUTPUT_CHANNELS,
+        rate=OUTPUT_SAMPLE_RATE,
+        input=False,
+        output=True,
+        frames_per_buffer=OUTPUT_CHUNK_SIZE,
+        output_device_index=output_default_output_index,
+        start=False,
+    )
+    input_stream.start_stream()
+    output_stream.start_stream()
+
+    print("Start Processing")
     async with RTLowLevelClient(
         endpoint, key_credential=AzureKeyCredential(key), azure_deployment=deployment
     ) as client:
@@ -260,28 +317,94 @@ async def with_azure_openai():
                 session=SessionUpdateParams(
                     turn_detection=ServerVAD(type="server_vad"),
                     input_audio_transcription=InputAudioTranscription(model="whisper-1"),
+                    voice=VOICE_TYPE,
+                    instructions=INSTRUCTIONS,
+                    temperature=TEMPERATURE,
+                    max_response_output_tokens=MAX_RESPONSE_OUTPUT_TOKENS,
+                    tools=TOOLS,
+                    tool_choice=TOOL_CHOICE,
                 )
             )
         )
+        send_task = asyncio.create_task(send_audio(client, input_stream))
+        receive_task = asyncio.create_task(receive_messages(client, output_stream))
 
-        await asyncio.gather(send_audio(client), receive_messages(client))
+        await asyncio.gather(send_task, receive_task)
 
 
 async def with_openai():
     key = get_env_var("OPENAI_API_KEY")
     model = get_env_var("OPENAI_MODEL")
+
+    p = pyaudio.PyAudio()
+    input_default_input_index = p.get_default_input_device_info()['index']
+    input_stream = p.open(
+        format=STREAM_FORMAT,
+        channels=INPUT_CHANNELS,
+        rate=INPUT_SAMPLE_RATE,
+        input=True,
+        output=False,
+        frames_per_buffer=INPUT_CHUNK_SIZE,
+        input_device_index=input_default_input_index,
+        start=False,
+    )
+    output_default_output_index = p.get_default_output_device_info()['index']
+    output_stream = p.open(
+        format=STREAM_FORMAT,
+        channels=OUTPUT_CHANNELS,
+        rate=OUTPUT_SAMPLE_RATE,
+        input=False,
+        output=True,
+        frames_per_buffer=OUTPUT_CHUNK_SIZE,
+        output_device_index=output_default_output_index,
+        start=False,
+    )
+    input_stream.start_stream()
+    output_stream.start_stream()
+
+    print("Start Processing")
     async with RTLowLevelClient(key_credential=AzureKeyCredential(key), model=model) as client:
-        print(SessionUpdateMessage(session=SessionUpdateParams(turn_detection=ServerVAD(type="server_vad"))).model_dump_json())
         await client.send(
             SessionUpdateMessage(
                 session=SessionUpdateParams(
-                    turn_detection=ServerVAD(type="server_vad"),
+                    model=model,
+                    modalities=["text", "audio"],
+                    input_audio_format="pcm16",
+                    output_audio_format="pcm16",
+                    turn_detection=ServerVAD(type="server_vad", threshold=0.5, prefix_padding_ms=200, silence_duration_ms=200),
+                    input_audio_transcription=InputAudioTranscription(model="whisper-1"),
+                    voice=VOICE_TYPE,
+                    instructions=INSTRUCTIONS,
+                    temperature=TEMPERATURE,
+                    max_response_output_tokens=MAX_RESPONSE_OUTPUT_TOKENS,
+                    tools=TOOLS,
+                    tool_choice=TOOL_CHOICE,
+                )
+            )
+        )
+        print(
+            SessionUpdateMessage(
+                session=SessionUpdateParams(
+                    model=model,
+                    modalities=["text", "audio"],
+                    input_audio_format="pcm16",
+                    output_audio_format="pcm16",
+                    turn_detection=ServerVAD(type="server_vad", threshold=0.5, prefix_padding_ms=200, silence_duration_ms=200),
+                    input_audio_transcription=InputAudioTranscription(model="whisper-1"),
+                    voice=VOICE_TYPE,
+                    instructions=INSTRUCTIONS,
+                    temperature=TEMPERATURE,
+                    max_response_output_tokens=MAX_RESPONSE_OUTPUT_TOKENS,
+                    tools=TOOLS,
+                    tool_choice=TOOL_CHOICE,
                 )
             )
         )
 
+        send_task = asyncio.create_task(send_audio(client, input_stream))
+        receive_task = asyncio.create_task(receive_messages(client, output_stream))
 
-        await asyncio.gather(send_audio(client), receive_messages(client))
+        await asyncio.gather(send_task, receive_task)
 
 
 if __name__ == "__main__":
