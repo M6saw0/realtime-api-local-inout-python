@@ -37,6 +37,7 @@ TOOLS = [
     }
 ]
 TOOL_CHOICE = "auto"
+
 def get_your_info(query: str):
     information = (
         "Your name is 'Hanako' and you are a girl."

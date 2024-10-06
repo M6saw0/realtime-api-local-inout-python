@@ -39,5 +39,19 @@ python voice_chat.py azure
 python voice_chat.py openai
 ```
 
+## Dialogue
+In addition to voice dialogue, `dialogue.py` implements the following features:
+
+- Function execution
+- Conversation termination (session reset)
+
+This allows for more versatile conversations, and at the same time, when a conversation ends, it enables the session to restart, which is expected to reduce token costs.
+
+```bash
+python dialogue.py azure
+# Or 
+python dialogue.py openai
+```
+
 ## Reference Links
 - [Azure-Samples/aoai-realtime-audio-sdk](https://github.com/Azure-Samples/aoai-realtime-audio-sdk/tree/main/python)
