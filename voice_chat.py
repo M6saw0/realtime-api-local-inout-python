@@ -5,8 +5,10 @@ import asyncio
 import base64
 import json
 import os
+import queue
 import sys
 import time
+import threading
 
 from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
@@ -23,7 +25,6 @@ from rtclient import (
     ResponseCreateParams,
     ItemCreateMessage,
     FunctionCallOutputItem,
-    Item,
 )
 from config import (
     INPUT_SAMPLE_RATE,
@@ -33,7 +34,6 @@ from config import (
     STREAM_FORMAT,
     INPUT_CHANNELS,
     OUTPUT_CHANNELS,
-    OUTPUT_SAMPLE_WIDTH,
     INSTRUCTIONS,
     VOICE_TYPE,
     TEMPERATURE,
@@ -42,45 +42,81 @@ from config import (
     TOOL_CHOICE,
     TOOL_MAP
 )
+from logger import Logger
 
+logger = Logger()
+audio_input_queue = queue.Queue()
+audio_output_queue = queue.Queue()
+execute_tool_queue = asyncio.Queue()
+client_event_queue = asyncio.Queue()
 
 
 async def call_tool(client: RTLowLevelClient, previous_item_id: str, call_id: str, tool_name: str, arguments: dict):
-    tool_func = TOOL_MAP[tool_name]
-    tool_output = tool_func(**arguments)
-    print(f"tool_output: {tool_output}")
-    await client.send(
-        ItemCreateMessage(
-            item=FunctionCallOutputItem(
-                call_id=call_id, 
-                output=tool_output,
-            ),
-            previous_item_id=previous_item_id,
-        )
+    await execute_tool_queue.put(
+        {
+            "previous_item_id": previous_item_id,
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "arguments": arguments
+        }
     )
-    await client.send(
-        ResponseCreateMessage(
-            response=ResponseCreateParams(
+
+async def execute_tool(client: RTLowLevelClient):
+    while True:
+        message = await execute_tool_queue.get()
+
+        previous_item_id = message["previous_item_id"]
+        call_id = message["call_id"]
+        tool_name = message["tool_name"]
+        arguments = message["arguments"]
+        tool_func = TOOL_MAP[tool_name]
+        tool_output = tool_func(**arguments)
+        print(f"tool_output: {tool_output}")
+        await logger.info("Client | conversation.item.create (function_call_output)")
+        await client_event_queue.put(
+            ItemCreateMessage(
+                item=FunctionCallOutputItem(
+                    call_id=call_id, 
+                    output=tool_output,
+                ),
+                previous_item_id=previous_item_id,
             )
         )
-    )
+        await logger.info("Client | response.create")
+        await client_event_queue.put(
+            ResponseCreateMessage(
+                response=ResponseCreateParams(
+                )
+            )
+        )
+
+async def send_text_client_event(client: RTLowLevelClient):
+    while True:
+        message = await client_event_queue.get()
+        await client.send(message)
 
 
-async def send_audio(client: RTLowLevelClient, input_stream: pyaudio.Stream):
-    def get_audio_data():
-        try: 
-            return input_stream.read(INPUT_CHUNK_SIZE, exception_on_overflow=False)
-        except Exception as e:
-            return None
-    while not client.closed:
-        audio_data = await asyncio.get_event_loop().run_in_executor(None, get_audio_data)
+def listen_audio(input_stream: pyaudio.Stream):
+    while True:
+        audio_data = input_stream.read(INPUT_CHUNK_SIZE, exception_on_overflow=False)
         if audio_data is None:
             continue
         base64_audio = base64.b64encode(audio_data).decode("utf-8")
+        audio_input_queue.put(base64_audio)
+
+async def send_audio(client: RTLowLevelClient):
+    while not client.closed:
+        base64_audio = await asyncio.get_event_loop().run_in_executor(None, audio_input_queue.get)
+        await logger.info("Client | input_audio_buffer.append")
         await client.send(InputAudioBufferAppendMessage(audio=base64_audio))
+        await asyncio.sleep(0)
 
+def play_audio(output_stream: pyaudio.Stream):
+    while True:
+        audio_data = audio_output_queue.get()
+        output_stream.write(audio_data)
 
-async def receive_messages(client: RTLowLevelClient, output_stream: pyaudio.Stream):
+async def receive_messages(client: RTLowLevelClient):
     while True:
         message = await client.recv()
         # print(f"{message=}")
@@ -88,32 +124,32 @@ async def receive_messages(client: RTLowLevelClient, output_stream: pyaudio.Stre
             continue
         match message.type:
             case "session.created":
-                # print("Session Created Message")
-                # print(f"  Model: {message.session.model}")
-                # print(f"  Session Id: {message.session.id}")
-                pass
+                await logger.info(f"Server | session.created | model: {message.session.model}, session_id: {message.session.id}")
             case "error":
-                print("Error Message")
-                print(f"  Error: {message.error}")
-                pass
+                await logger.info(f"Server | error | error message:{message.error}")
             case "input_audio_buffer.committed":
-                print("Input Audio Buffer Committed Message")
-                print(f"  Item Id: {message.item_id}")
+                await logger.info(f"Server | input_audio_buffer.committed | item_id:{message.item_id}")
                 pass
             case "input_audio_buffer.cleared":
+                await logger.info(f"Server | input_audio_buffer.cleared | item_id: {message.item_id}")
                 print("Input Audio Buffer Cleared Message")
                 pass
             case "input_audio_buffer.speech_started":
+                await logger.info(f"Server | input_audio_buffer.speech_started | item_id: {message.item_id}, audio_start_ms: {message.audio_start_ms}")
                 print("Input Audio Buffer Speech Started Message")
                 print(f"  Item Id: {message.item_id}")
                 print(f"  Audio Start [ms]: {message.audio_start_ms}")
-                pass
+                while not audio_output_queue.empty():
+                    audio_output_queue.get()
+                await asyncio.sleep(0)
             case "input_audio_buffer.speech_stopped":
+                await logger.info(f"Server | input_audio_buffer.speech_stopped | item_id: {message.item_id}, audio_end_ms: {message.audio_end_ms}")
                 print("Input Audio Buffer Speech Stopped Message")
                 print(f"  Item Id: {message.item_id}")
                 print(f"  Audio End [ms]: {message.audio_end_ms}")
                 pass
             case "conversation.item.created":
+                await logger.info(f"Server | conversation.item.created | item_id: {message.item.id}, previous_item_id: {message.previous_item_id}")
                 print("Conversation Item Created Message")
                 print(f"  Id: {message.item.id}")
                 print(f"  Previous Id: {message.previous_item_id}")
@@ -128,24 +164,29 @@ async def receive_messages(client: RTLowLevelClient, output_stream: pyaudio.Stre
                             print(f"  Audio Transcript: {content.transcript}")
                 pass
             case "conversation.item.truncated":
+                await logger.info(f"Server | conversation.item.truncated | item_id: {message.item_id}, content_index: {message.content_index}, audio_end_ms: {message.audio_end_ms}")
                 print("Conversation Item Truncated Message")
                 print(f"  Id: {message.item_id}")
                 print(f" Content Index: {message.content_index}")
                 print(f"  Audio End [ms]: {message.audio_end_ms}")
             case "conversation.item.deleted":
-                # print("Conversation Item Deleted Message")
-                # print(f"  Id: {message.item_id}")
+                await logger.info(f"Server | conversation.item.deleted | item_id: {message.item_id}")
+                print("Conversation Item Deleted Message")
+                print(f"  Id: {message.item_id}")
                 pass
             case "conversation.item.input_audio_transcription.completed":
+                await logger.info(f"Server | conversation.item.input_audio_transcription.completed | item_id: {message.item_id}, content_index: {message.content_index}, transcript: {message.transcript}")
                 print("Input Audio Transcription Completed Message")
                 print(f"  Id: {message.item_id}")
                 print(f"  Content Index: {message.content_index}")
                 print(f"  Transcript: {message.transcript}")
             case "conversation.item.input_audio_transcription.failed":
+                await logger.info(f"Server | conversation.item.input_audio_transcription.failed | item_id: {message.item_id}, error: {message.error}")
                 print("Input Audio Transcription Failed Message")
                 print(f"  Id: {message.item_id}")
                 print(f"  Error: {message.error}")
             case "response.created":
+                await logger.info(f"Server | response.created | response_id: {message.response.id}")
                 print("Response Created Message")
                 print(f"  Response Id: {message.response.id}")
                 print("  Output Items:")
@@ -182,54 +223,37 @@ async def receive_messages(client: RTLowLevelClient, output_stream: pyaudio.Stre
                         print(f"    Call Id: {item.call_id}")
                         print(f"    Output: {item.output}")
             case "response.done":
+                await logger.info(f"Server | response.done | response_id: {message.response.id}")
                 # print("Response Done Message")
                 # print(f"  Response Id: {message.response.id}")
                 # if message.response.status_details:
                 #     print(f"  Status Details: {message.response.status_details.model_dump_json()}")
-                # break
                 pass
             case "response.output_item.added":
-                # print("Response Output Item Added Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  Item Id: {message.item.id}")
-                pass
+                await logger.info(f"Server | response.output_item.added | response_id: {message.response_id}, item_id: {message.item.id}")
             case "response.output_item.done":
-                # print("Response Output Item Done Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  Item Id: {message.item.id}")
-                pass
-
+                await logger.info(f"Server | response.output_item.done | response_id: {message.response_id}, item_id: {message.item.id}")
             case "response.content_part.added":
-                # print("Response Content Part Added Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  Item Id: {message.item_id}")
-                pass
+                await logger.info(f"Server | response.content_part.added | response_id: {message.response_id}, item_id: {message.item_id}")
             case "response.content_part.done":
-                # print("Response Content Part Done Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  ItemPart Id: {message.item_id}")
-                pass
+                await logger.info(f"Server | response.content_part.done | response_id: {message.response_id}, item_id: {message.item_id}")
             case "response.text.delta":
-                # print("Response Text Delta Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  Text: {message.delta}")
-                pass
+                await logger.info(f"Server | response.text.delta | response_id: {message.response_id}, item_id: {message.item_id}, text: {message.delta}")
             case "response.text.done":
+                await logger.info(f"Server | response.text.done | response_id: {message.response_id}, item_id: {message.item_id}, text: {message.text}")
                 print("Response Text Done Message")
                 print(f"  Response Id: {message.response_id}")
                 print(f"  Text: {message.text}")
             case "response.audio_transcript.delta":
-                # print("Response Audio Transcript Delta Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  Item Id: {message.item_id}")
-                # print(f"  Transcript: {message.delta}")
-                pass
+                await logger.info(f"Server | response.audio_transcript.delta | response_id: {message.response_id}, item_id: {message.item_id}, transcript: {message.delta}")
             case "response.audio_transcript.done":
+                await logger.info(f"Server | response.audio_transcript.done | response_id: {message.response_id}, item_id: {message.item_id}, transcript: {message.transcript}")
                 print("Response Audio Transcript Done Message")
                 print(f"  Response Id: {message.response_id}")
                 print(f"  Item Id: {message.item_id}")
                 print(f"  Transcript: {message.transcript}")
             case "response.audio.delta":
+                await logger.info(f"Server | response.audio.delta | response_id: {message.response_id}, item_id: {message.item_id}, audio_data_length: {len(message.delta)}")
                 # print("Response Audio Delta Message")
                 # print(f"  Response Id: {message.response_id}")
                 # print(f"  Item Id: {message.item_id}")
@@ -237,37 +261,25 @@ async def receive_messages(client: RTLowLevelClient, output_stream: pyaudio.Stre
                 audio_data = base64.b64decode(message.delta)
                 # print(f"  Audio Binary Data Length: {len(audio_data)}")
                 # audio_duration = len(audio_data) / OUTPUT_SAMPLE_RATE / OUTPUT_SAMPLE_WIDTH / OUTPUT_CHANNELS
-                # print(f"  Audio Duration: {audio_duration}")
-                # start_time = time.time()
-                # audio_data = np.frombuffer(audio_data, dtype=np.int16).tobytes()
+                # print(f"  Audio Duration Time: {audio_duration}")
                 for i in range(0, len(audio_data), OUTPUT_CHUNK_SIZE):
-                    await asyncio.get_event_loop().run_in_executor(None, output_stream.write, audio_data[i:i+OUTPUT_CHUNK_SIZE])
-                # await asyncio.sleep(max(0, audio_duration - (time.time() - start_time) - 0.05))
+                    audio_output_queue.put(audio_data[i:i+OUTPUT_CHUNK_SIZE])
                 await asyncio.sleep(0)
             case "response.audio.done":
-                # print("Response Audio Done Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  Item Id: {message.item_id}")
-                pass
+                await logger.info(f"Server | response.audio.done | response_id: {message.response_id}, item_id: {message.item_id}")
             case "response.function_call_arguments.delta":
-                # print("Response Function Call Arguments Delta Message")
-                # print(f"  Response Id: {message.response_id}")
-                # print(f"  Arguments: {message.delta}")
-                pass
+                await logger.info(f"Server | response.function_call_arguments.delta | response_id: {message.response_id}, item_id: {message.item_id}, arguments: {message.delta}")
             case "response.function_call_arguments.done":
-                print("Response Function Call Arguments Done Message")
-                print(f"  Response Id: {message.response_id}")
-                print(f"  Arguments: {message.arguments}")
+                await logger.info(f"Server | response.function_call_arguments.done | response_id: {message.response_id}, item_id: {message.item_id}, arguments: {message.arguments}")
                 try:
                     arguments = json.loads(message.arguments)
                     await call_tool(client, message.item_id, message.call_id, message.name, arguments)
                 except Exception as e:
                     print(f"Error calling tool: {e}")
             case "rate_limits.updated":
-                print("Rate Limits Updated Message")
-                print(f"  Rate Limits: {message.rate_limits}")
+                await logger.info(f"Server | rate_limits.updated | rate_limits: {message.rate_limits}")
             case _:
-                print("Unknown Message")
+                await logger.info(f"Server | {message.type}")
 
 
 def get_env_var(var_name: str) -> str:
@@ -312,6 +324,7 @@ async def with_azure_openai():
     async with RTLowLevelClient(
         endpoint, key_credential=AzureKeyCredential(key), azure_deployment=deployment
     ) as client:
+        await logger.info("Client | session.update")
         await client.send(
             SessionUpdateMessage(
                 session=SessionUpdateParams(
@@ -326,10 +339,15 @@ async def with_azure_openai():
                 )
             )
         )
-        send_task = asyncio.create_task(send_audio(client, input_stream))
-        receive_task = asyncio.create_task(receive_messages(client, output_stream))
+        threading.Thread(target=listen_audio, args=(input_stream,), daemon=True).start()
+        threading.Thread(target=play_audio, args=(output_stream,), daemon=True).start()
+        send_task = asyncio.create_task(send_audio(client))
+        receive_task = asyncio.create_task(receive_messages(client))
+        execute_tool_task = asyncio.create_task(execute_tool(client))
+        send_text_client_event_task = asyncio.create_task(send_text_client_event(client))
 
-        await asyncio.gather(send_task, receive_task)
+        await asyncio.gather(send_task, receive_task, execute_tool_task, send_text_client_event_task)
+
 
 
 async def with_openai():
@@ -364,6 +382,7 @@ async def with_openai():
 
     print("Start Processing")
     async with RTLowLevelClient(key_credential=AzureKeyCredential(key), model=model) as client:
+        await logger.info("Client | session.update")
         await client.send(
             SessionUpdateMessage(
                 session=SessionUpdateParams(
@@ -401,10 +420,14 @@ async def with_openai():
             )
         )
 
-        send_task = asyncio.create_task(send_audio(client, input_stream))
-        receive_task = asyncio.create_task(receive_messages(client, output_stream))
+        threading.Thread(target=listen_audio, args=(input_stream,), daemon=True).start()
+        threading.Thread(target=play_audio, args=(output_stream,), daemon=True).start()
+        send_task = asyncio.create_task(send_audio(client))
+        receive_task = asyncio.create_task(receive_messages(client))
+        execute_tool_task = asyncio.create_task(execute_tool(client))
+        send_text_client_event_task = asyncio.create_task(send_text_client_event(client))
 
-        await asyncio.gather(send_task, receive_task)
+        await asyncio.gather(send_task, receive_task, execute_tool_task, send_text_client_event_task)
 
 
 if __name__ == "__main__":

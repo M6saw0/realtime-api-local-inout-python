@@ -39,6 +39,8 @@ python voice_chat.py azure
 python voice_chat.py openai
 ```
 
+The logs are stored in the 'log' directory. The logs contain timestamps for Client Events and Server Events.
+
 ## Dialogue
 In addition to voice dialogue, `dialogue.py` implements the following features:
 

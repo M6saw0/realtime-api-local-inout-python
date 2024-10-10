@@ -1,5 +1,6 @@
 aiohttp
 azure-core
+loguru
 python-dotenv
 pyaudio
 pydantic

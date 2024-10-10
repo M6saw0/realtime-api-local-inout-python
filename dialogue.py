@@ -6,7 +6,9 @@ import base64
 import json
 import os
 import sys
+import queue
 import time
+import threading
 
 from azure.core.credentials import AzureKeyCredential
 from dotenv import load_dotenv
@@ -40,25 +42,6 @@ OUTPUT_SAMPLE_WIDTH = 2  # Output sample width
 VOICE_TYPE = "shimmer"  # alloy, echo, shimmer
 TEMPERATURE = 0.7
 MAX_RESPONSE_OUTPUT_TOKENS = 4096
-
-TOOLS = [
-    {
-        "type": "function",
-        "name": "get_your_info",
-        "description": "Get the information of your own.(e.g. name, age, hobby, favorite food, favorite color, favorite music, favorite movie, favorite game, favorite sport, favorite team, favorite player, favorite programming language)",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The query to get the information",
-                },
-            },
-            "required": ["query"],
-        },
-    }
-]
-TOOL_CHOICE = "auto"
 
 def get_your_info(query: str):
     information = (
@@ -100,6 +83,8 @@ TOOLS = [
         "parameters": {},
     }
 ]
+TOOL_CHOICE = "auto"
+
 INSTRUCTIONS = """Please do a role-play starting now.
 # Role-play Setting
 - Your name is 'Hanako' and you are a girl.
@@ -118,6 +103,11 @@ class DialogueSession:
         self.receive_task = None
         self.reset_event = asyncio.Event()
         self.reset_conversation_flag = False
+
+        self.audio_input_queue = queue.Queue()
+        self.audio_output_queue = queue.Queue()
+        self.execute_tool_queue = asyncio.Queue()
+        self.client_event_queue = asyncio.Queue()
 
     def get_env_var(self, var_name: str) -> str:
         value = os.environ.get(var_name)
@@ -152,92 +142,113 @@ class DialogueSession:
         self.output_stream.start_stream()
 
     async def call_tool(self, previous_item_id: str, call_id: str, tool_name: str, arguments: dict):
-        if tool_name == "finish_conversation":
-            print("Finishing conversation...")
-            # await self.client.send(
-            #     ItemCreateMessage(
-            #         item=FunctionCallOutputItem(
-            #             call_id=call_id, 
-            #             output="Conversation will be finished soon. Please say something appropriate when you finish the conversation.",
-            #         ),
-            #         previous_item_id=previous_item_id,
-            #     )
-            # )
-            # print("Conversation will be finished soon. Please say something appropriate when you finish the conversation.")
-            await self.client.send(
-                ResponseCreateMessage(
-                    response=ResponseCreateParams(
-                        modalities=["text", "audio"],
-                        append_input_items=[
-                            UserMessageItem(
-                                content=[
-                                    InputTextContentPart(
-                                        text="The conversation is about to end. Please conclude the conversation naturally, connecting it to the previous dialogue."
-                                    )
-                                ]
-                            )
-                        ]
-                    )
-                )
-            )
-            await self.reset_session()
-            return
+        await self.execute_tool_queue.put(
+            {
+                "previous_item_id": previous_item_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "arguments": arguments
+            }
+        )
 
-        elif tool_name == "get_your_info":
-            tool_output = get_your_info(**arguments)
-            print(f"Tool: 'get_your_info' called with arguments ({arguments})")
-            print(f"  Tool Output: {tool_output}")
-            # await self.client.send(
-            #     ItemCreateMessage(
-            #         item=FunctionCallOutputItem(
-            #             call_id=call_id, 
-            #             output=tool_output,
-            #         ),
-            #         previous_item_id=previous_item_id,
-            #     )
-            # )
-            await self.client.send(
-                ResponseCreateMessage(
-                    response=ResponseCreateParams(
-                        modalities=["text", "audio"],
-                        append_input_items=[
-                            UserMessageItem(
-                                content=[
-                                    InputTextContentPart(
-                                        text=(
-                                            "Below is the output of the function. Please use the following information to continue the previous conversation.\n"
-                                            "# Function Output\n"
-                                            f"{tool_output}"
+
+    async def execute_tool(self):
+        while True:
+            tool_info = await self.execute_tool_queue.get()
+
+            previous_item_id = tool_info["previous_item_id"]
+            call_id = tool_info["call_id"]
+            tool_name = tool_info["tool_name"]
+            arguments = tool_info["arguments"]
+
+            if tool_name == "finish_conversation":
+                print("Finishing conversation...")
+                await self.client_event_queue.put(
+                    ResponseCreateMessage(
+                        response=ResponseCreateParams(
+                            modalities=["text", "audio"],
+                            append_input_items=[
+                                UserMessageItem(
+                                    content=[
+                                        InputTextContentPart(
+                                            text="The conversation is about to end. Please conclude the conversation naturally, connecting it to the previous dialogue."
                                         )
-                                    )
-                                ]
-                            )
-                        ]
+                                    ]
+                                )
+                            ]
+                        )
                     )
                 )
-            )
-        else:
-            print(f"No such tool: {tool_name}")
+                await self.reset_session()
+                return
+
+            elif tool_name == "get_your_info":
+                tool_output = get_your_info(**arguments)
+                print(f"Tool: 'get_your_info' called with arguments ({arguments})")
+                print(f"  Tool Output: {tool_output}")
+                # await self.client_event_queue.put(
+                #     ItemCreateMessage(
+                #         item=FunctionCallOutputItem(
+                #             call_id=call_id, 
+                #             output=tool_output,
+                #         ),
+                #         previous_item_id=previous_item_id,
+                #     )
+                # )
+                await self.client_event_queue.put(
+                    ResponseCreateMessage(
+                        response=ResponseCreateParams(
+                            modalities=["text", "audio"],
+                            append_input_items=[
+                                UserMessageItem(
+                                    content=[
+                                        InputTextContentPart(
+                                            text=(
+                                                "Below is the output of the function. Please use the following information to continue the previous conversation.\n"
+                                                "# Function Output\n"
+                                                f"{tool_output}"
+                                            )
+                                        )
+                                    ]
+                                )
+                            ]
+                        )
+                    )
+                )
+            else:
+                print(f"No such tool: {tool_name}")
+
+
+    async def send_text_client_event(self):
+        while True:
+            message = await self.client_event_queue.get()
+            await self.client.send(message)
+
 
     async def reset_session(self):
         print("Requesting session reset...")
         self.reset_conversation_flag = True
 
-    async def send_audio(self, input_stream: pyaudio.Stream):
-        def get_audio_data():
-            try: 
-                return input_stream.read(INPUT_CHUNK_SIZE, exception_on_overflow=False)
-            except Exception as e:
-                print(f"Error reading audio data: {e}")
-                return None
-        while not self.client.closed:
-            audio_data = await asyncio.get_event_loop().run_in_executor(None, get_audio_data)
+    def listen_audio(self, input_stream: pyaudio.Stream):
+        while True:
+            audio_data = input_stream.read(INPUT_CHUNK_SIZE, exception_on_overflow=False)
             if audio_data is None:
                 continue
             base64_audio = base64.b64encode(audio_data).decode("utf-8")
-            await self.client.send(InputAudioBufferAppendMessage(audio=base64_audio))
+            self.audio_input_queue.put(base64_audio)
 
-    async def receive_messages(self, output_stream: pyaudio.Stream):
+    async def send_audio(self):
+        while not self.client.closed:
+            base64_audio = await asyncio.get_event_loop().run_in_executor(None, self.audio_input_queue.get)
+            await self.client.send(InputAudioBufferAppendMessage(audio=base64_audio))
+            await asyncio.sleep(0)
+
+    def play_audio(self, output_stream: pyaudio.Stream):
+        while True:
+            audio_data = self.audio_output_queue.get()
+            output_stream.write(audio_data)
+
+    async def receive_messages(self):
         while True:
             message = await self.client.recv()
             if message is None:
@@ -251,6 +262,9 @@ class DialogueSession:
                 case "input_audio_buffer.speech_started":
                     print("Input Audio Buffer Speech Started Message")
                     print(f"  Audio Start [ms]: {message.audio_start_ms}")
+                    while not self.audio_output_queue.empty():
+                        self.audio_output_queue.get()
+                    await asyncio.sleep(0)
                 case "input_audio_buffer.speech_stopped":
                     print("Input Audio Buffer Speech Stopped Message")
                     print(f"  Audio End [ms]: {message.audio_end_ms}")
@@ -332,11 +346,10 @@ class DialogueSession:
                         self.reset_event.set()
                         self.reset_conversation_flag = False
                 case "response.audio.delta":
+                    print("Response Audio Delta Message")
                     audio_data = base64.b64decode(message.delta)
                     for i in range(0, len(audio_data), OUTPUT_CHUNK_SIZE):
-                        await asyncio.get_event_loop().run_in_executor(
-                            None, output_stream.write, audio_data[i:i + OUTPUT_CHUNK_SIZE]
-                        )
+                        self.audio_output_queue.put(audio_data[i:i+OUTPUT_CHUNK_SIZE])
                     await asyncio.sleep(0)
                 # case "response.done":
                     # print("Response Done Message")
@@ -395,21 +408,37 @@ class DialogueSession:
         async with client_init as client:
             self.client = client
             await self.client.send(SessionUpdateMessage(session=session_params))
-            self.send_task = asyncio.create_task(self.send_audio(self.input_stream))
-            self.receive_task = asyncio.create_task(self.receive_messages(self.output_stream))
+
+            threading.Thread(target=self.listen_audio, args=(self.input_stream,), daemon=True).start()
+            threading.Thread(target=self.play_audio, args=(self.output_stream,), daemon=True).start()
+            send_audio_task = asyncio.create_task(self.send_audio())
+            receive_server_event_task = asyncio.create_task(self.receive_messages())
+            execute_tool_task = asyncio.create_task(self.execute_tool())
+            send_text_client_event_task = asyncio.create_task(self.send_text_client_event())
             reset_wait_task = asyncio.create_task(self.reset_event.wait())
 
             # セッションがリセットされるまで待機
             done, pending = await asyncio.wait(
-                [self.send_task, self.receive_task, reset_wait_task],
+                [
+                    send_audio_task, 
+                    receive_server_event_task, 
+                    execute_tool_task, 
+                    send_text_client_event_task, 
+                    reset_wait_task
+                ],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
             # リセットが要求された場合の処理
             if reset_wait_task in done:
                 self.client.close()
-                self.send_task.cancel()
-                self.receive_task.cancel()
+                send_audio_task.cancel()
+                receive_server_event_task.cancel()
+                execute_tool_task.cancel()
+                send_text_client_event_task.cancel()
+                reset_wait_task.cancel()
+
+
                 # try:
                 #     await asyncio.gather(*pending, return_exceptions=True)
                 # except Exception as e:
